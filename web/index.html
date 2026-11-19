@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>模拟调试回放器</title>
+<style>
+  body { background:#181a1f; color:#cfd3dc; font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; margin:0; padding:12px; }
+  #app { display:flex; gap:12px; align-items:flex-start; }
+  canvas { background:#101116; border:1px solid #333; display:block; }
+  #timeline { margin-top:6px; cursor:pointer; }
+  #panel { width:340px; white-space:pre-wrap; background:#101116; border:1px solid #333; padding:10px; min-height:540px; }
+  #controls { margin-top:6px; display:flex; flex-wrap:wrap; gap:6px; max-width:960px; }
+  button { background:#262a33; color:#cfd3dc; border:1px solid #3a3f4b; padding:4px 10px; cursor:pointer; font:inherit; }
+  button:hover { background:#313743; }
+  button.active { background:#3d5a99; border-color:#5a7bc0; }
+  #hint { color:#7a8194; margin-top:6px; max-width:960px; }
+  .deviating { color:#ff6b6b; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div>
+    <canvas id="view" width="960" height="540"></canvas>
+    <canvas id="timeline" width="960" height="52"></canvas>
+    <div id="controls">
+      <button id="bPlay">播放/暂停 [K]</button>
+      <button id="bStep">单步 [.]</button>
+      <button id="bBack">后退5s [,]</button>
+      <button id="bFwd">前进5s [⇧.]</button>
+      <button id="bSpeed">速度 1x</button>
+      <button id="bFault">注入故障 [F]</button>
+      <button id="bFin">结束录制 [T]</button>
+      <button id="bVerify">校验 [V]</button>
+      <button id="bTamper">篡改输入 [X]</button>
+      <button id="bRestart">重开 [R]</button>
+      <button id="bSave">保存回放</button>
+      <button id="bLoad">加载回放</button>
+      <button id="bSample">载入故障样例</button>
+    </div>
+    <div id="hint">
+      实况模式：← → 移动，空格/↑ 跳跃，Z 攻击，F 注入机关故障，T 结束录制进入回放。
+      回放模式：K 播放/暂停，. 单步，, 后退，点击时间轴定位（借助检查点），V 校验（从头+每个检查点），X 在当前 tick 篡改输入演示偏离检测。
+      速度按钮只改变渲染/推进速率，不改变规则轨迹。R 重开（Shift+R 换种子）。
+    </div>
+  </div>
+  <div id="panel"></div>
+</div>
+<input type="file" id="file" accept=".json" hidden>
+<script src="../sim/rng.js"></script>
+<script src="../sim/serialize.js"></script>
+<script src="../sim/scene.js"></script>
+<script src="../sim/sim.js"></script>
+<script src="../sim/bot.js"></script>
+<script src="../sim/recorder.js"></script>
+<script src="../sim/replay.js"></script>
+<script src="../sim/frameloop.js"></script>
+<script src="ui.js"></script>
+</body>
+</html>
