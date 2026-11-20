@@ -4,6 +4,7 @@
   const S = window.SIM;
   const scene = S.scene.SCENE;
   const sim = S.sim, ser = S.serialize, replay = S.replay;
+  const branchMod = S.branch;
   const Recorder = S.recorder.Recorder;
   const FrameLoop = S.frameloop.FrameLoop;
   const INPUT = sim.INPUT;
@@ -31,6 +32,178 @@
   const speeds = [0.25, 1, 2, 4];
   let speedIdx = 1;
 
+  // ---------- 分支树状态 ----------
+  let tree = null;              // 当前回放对应的 BranchTree
+  let activeBranch = 'root';    // 当前查看的分支 id
+  let selectedEntity = null;    // 画面点选的实体
+  let provenance = null;        // 该实体的溯源结果
+  let mergeReport = null;       // 最近一次合并预演
+  let branchStatus = '';        // 面板提示
+  let marker = null;            // 画面点选位置
+
+  function branchTick() {
+    if (!tree) return 0;
+    const t = tree.get(activeBranch);
+    return t ? Math.min(t.cache.endTick, state ? state.tick : 0) : 0;
+  }
+
+  function resetBranches() {
+    tree = null; activeBranch = 'root';
+    selectedEntity = null; provenance = null; mergeReport = null; branchStatus = '';
+    marker = null;
+  }
+
+  function ensureTree() {
+    if (!recording) throw new Error('请先结束录制或载入一条回放');
+    if (!tree) {
+      tree = new branchMod.BranchTree(scene, recording, { checkpointEvery: recording.checkpointEvery });
+      tree.buildRoot();
+    }
+    return tree;
+  }
+
+  // 在当前 tick 最近的检查点上分叉
+  function forkAtCheckpoint(id, label, layer) {
+    ensureTree();
+    const at = nearestCheckpointTick(state.tick);
+    const node = tree.fork(id === 'root' ? 'root' : id, { id: id, tick: at, label: label, layer: layer });
+    activeBranch = node.id;
+    branchStatus = '已从检查点 tick ' + at + ' 派生 ' + node.id + '：' + label;
+    return node;
+  }
+
+  function nearestCheckpointTick(t) {
+    let best = 0;
+    for (const c of recording.checkpoints) if (c.tick <= t && c.tick > best) best = c.tick;
+    if (!best) {
+      // 基于分支自己的检查点
+      const n = tree.get(activeBranch);
+      best = n && n.cache ? n.cache.startTick : 0;
+    }
+    return best;
+  }
+
+  function seekBranch(branchId, tick) {
+    ensureTree();
+    tree.seek(branchId, 0); // 校验分支可用
+    activeBranch = branchId;
+    state = tree.seek(branchId, tick);
+    playing = false;
+  }
+
+  function deriveX() {
+    if (!recording) return;
+    ensureTree();
+    const at = nearestCheckpointTick(state.tick);
+    try {
+      const node = tree.fork('root', { id: 'X', tick: at, label: 'X 延迟领取 pickup4' });
+      const vals = [];
+      const st = tree.seek(node.id, at);
+      const sc = node.cache.scene;
+      for (let t = at; t < Math.min(at + 900, node.cache.endTick); t++) {
+        let input;
+        if (st.pickups[4].taken) input = tree._inputAt(node, t);
+        else {
+          const view = ser.deepClone(st);
+          view.pickups[4].taken = true;
+          input = S.bot.botInput(sc, view) & 15;
+        }
+        vals.push(input);
+        sim.step(sc, st, input, tree.events.get(t) || []);
+      }
+      tree.update(node.id, function (L) {
+        L.windows = (L.windows || []).concat([{ id: node.id + ':delay-pickup4', start: at, end: Math.min(at + 900, node.cache.endTick), values: vals }]);
+      });
+      activeBranch = node.id;
+      branchStatus = '派生 X：在 tick ' + at + ' 之后推迟领取 pickup4';
+      seekBranch(node.id, at);
+    } catch (e) { branchStatus = '派生失败: ' + e.message; }
+  }
+
+  function deriveY() {
+    if (!recording) return;
+    ensureTree();
+    const at = nearestCheckpointTick(state.tick);
+    try {
+      const node = tree.fork('root', {
+        id: 'Y', tick: at, label: 'Y 延后开门并追加动作',
+        layer: {
+          scene: { 'door.openTick': 3180 },
+          actions: [{ id: 'Y:wait-door', start: 2990, end: 3180, entity: 'player', intent: { kind: 'pause' } }],
+          appends: [{ id: 'Y:pass-door', start: 3180, end: 3400, entity: 'door', intent: { kind: 'pass_door' } }]
+        }
+      });
+      activeBranch = node.id;
+      branchStatus = '派生 Y：开门时间改到 3180，父路径结束后追加过门动作';
+      seekBranch(node.id, at);
+    } catch (e) { branchStatus = '派生失败: ' + e.message; }
+  }
+
+  function deriveRaw() {
+    if (!recording) return;
+    const base = tree ? activeBranch : (ensureTree(), 'root');
+    const at = nearestCheckpointTick(state.tick);
+    try {
+      const node = tree.fork(base, { tick: at, label: '空白分支@' + at });
+      activeBranch = node.id;
+      branchStatus = '派生空白分支 ' + node.id + '：从 tick ' + at + ' 起可编辑';
+      seekBranch(node.id, at);
+    } catch (e) { branchStatus = '派生失败: ' + e.message; }
+  }
+
+  function runMerge() {
+    ensureTree();
+    const ids = tree.active().map(function (n) { return n.id; }).filter(function (x) { return x !== 'root'; });
+    const pick = ids.slice(-2);
+    if (pick.length < 2) { branchStatus = '至少需要两条分支才能合并'; return; }
+    try {
+      mergeReport = tree.mergePreview(pick[0], pick[1]);
+      branchStatus = mergeReport.ok
+        ? '合并预演 ' + pick[0] + ' + ' + pick[1] + '：与完整重演逐项一致'
+        : '合并预演 ' + pick[0] + ' + ' + pick[1] + '：存在 ' + mergeReport.conflicts.length + ' 个冲突';
+    } catch (e) { branchStatus = '合并失败: ' + e.message; }
+  }
+
+  function pruneActive() {
+    if (!tree || activeBranch === 'root') { branchStatus = '原记录不能清理'; return; }
+    try {
+      const parent = tree.get(activeBranch).parentId || 'root';
+      const r = tree.prune(activeBranch);
+      branchStatus = '已清理 ' + r.pruned.join('、') + '，释放 ' + r.released.length + ' 个检查点引用';
+      activeBranch = parent;
+      selectedEntity = null; provenance = null; mergeReport = null;
+      seekBranch(parent, state.tick);
+    } catch (e) { branchStatus = '清理失败: ' + e.message; }
+  }
+
+  function reopen() {
+    if (!tree) { branchStatus = '还没有分支树'; return; }
+    try {
+      const target = tree.get(activeBranch) ? activeBranch : 'root';
+      const parent = target === 'root' ? 'root' : (tree.get(target).parentId || 'root');
+      const at = Math.min(state ? state.tick : 0, tree.get(parent).cache.endTick);
+      const r = tree.reopenFrom(parent, at);
+      activeBranch = parent;
+      state = r.state;
+      selectedEntity = null; provenance = null; mergeReport = null;
+      branchStatus = '从母分支 ' + parent + ' 重新开局于 tick ' + state.tick;
+    } catch (e) { branchStatus = '重新开局失败: ' + e.message; }
+  }
+
+  function pickEntity(x, y) {
+    if (!tree) return;
+    const id = branchMod.findEntityAt(tree.get(activeBranch).cache.scene || scene, state, x, y);
+    selectedEntity = id;
+    provenance = id ? tree.firstUse(activeBranch, id) : null;
+    if (!id) branchStatus = '该位置没有可点选的实体';
+  }
+
+  function stepBranch() {
+    if (state.tick >= tree.get(activeBranch).cache.endTick) { playing = false; return; }
+    const node = tree.get(activeBranch);
+    sim.step(node.cache.scene || scene, state, tree._inputAt(node, state.tick), tree.events.get(state.tick) || []);
+  }
+
   function startLive(newSeed) {
     seed = newSeed >>> 0;
     state = sim.initialState(scene, seed);
@@ -39,6 +212,7 @@
     recording = null; evMap = null;
     verifyReport = null; cpReports = null;
     tamperTick = -1; lastSeekCp = null;
+    resetBranches();
     mode = 'live';
     playing = true;
   }
@@ -56,6 +230,7 @@
     evMap = replay.eventsByTick(recording);
     verifyReport = null; cpReports = null;
     tamperTick = -1;
+    resetBranches();
     mode = 'replay';
     seek(0);
     playing = true;
@@ -180,6 +355,18 @@
     if (mode === 'live') label('● REC  seed=' + seed, 8, 16, '#ff5252');
     else label('REPLAY  tick ' + state.tick + '/' + recording.endTick, 8, 16, '#9ccc65');
     if (tamperTick >= 0) label('篡改@' + tamperTick, 8, 34, '#ff6b6b');
+    if (tree) label('分支 ' + activeBranch + '  tick ' + state.tick + '/' +
+      tree.get(activeBranch).cache.endTick, 8, 52, '#e5c07b');
+    if (selectedEntity) {
+      label('点选: ' + selectedEntity, 8, 70, '#e5c07b');
+      if (marker) {
+        ctx.strokeStyle = '#e5c07b';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(marker.x, marker.y, 12, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
   }
 
   function label(text, x, y, color) {
@@ -289,6 +476,38 @@
     } else {
       L.push('(按 V 校验：从头 + 每个检查点重演比对)');
     }
+    if (tree) {
+      L.push('');
+      L.push('── 分支树 ──');
+      L.push('当前分支: ' + activeBranch + (tree.get(activeBranch) ? ' [' + tree.get(activeBranch).label + ']' : ''));
+      if (branchStatus) L.push(branchStatus);
+      const tot = tree.store.totals();
+      L.push('检查点存储: ' + tot.entries + ' 快照 / ' + tot.refs + ' 引用 / ' + tot.shared + ' 个被共享');
+      if (provenance) {
+        L.push('');
+        L.push('── 实体溯源 (' + (selectedEntity || '-') + ') ──');
+        L.push(provenance.explanation || provenance.reason || '(无)');
+      }
+      if (mergeReport) {
+        L.push('');
+        L.push('── 合并预演 ' + mergeReport.aId + ' + ' + mergeReport.bId + ' ──');
+        for (const e of mergeReport.edits) {
+          L.push('[' + (e.decision === 'independent' ? '独立' : e.decision === 'dependent' ? '依赖' : '冲突') + '] ' + e.id);
+        }
+        for (const c of mergeReport.conflicts) L.push('冲突: ' + c.reason);
+        if (mergeReport.merged) {
+          const m = mergeReport.merged, r = mergeReport.reference;
+          L.push('合并: 背包=' + m.pickupCount + '/' + m.pickups.length +
+            ' 拾取=' + m.triggers.pickups + ' 开门=' + m.triggers.doorOpen + ' 过门=' + m.triggers.finish);
+          L.push('完整: 背包=' + r.pickupCount + '/' + r.pickups.length +
+            ' 拾取=' + r.triggers.pickups + ' 开门=' + r.triggers.doorOpen + ' 过门=' + r.triggers.finish);
+          L.push('逐项一致: ' + (mergeReport.sameAsReference ? 'YES' : 'NO'));
+        }
+      }
+    } else if (mode === 'replay') {
+      L.push('');
+      L.push('(按 B 进入分支树，在上一个检查点分叉)');
+    }
     panel.textContent = L.join('\n');
     panel.classList.toggle('deviating', !!(verifyReport && !verifyReport.ok));
   }
@@ -303,6 +522,7 @@
       const n = frameLoop.advance(dt);
       for (let i = 0; i < n; i++) {
         if (mode === 'live') liveTick();
+        else if (tree) stepBranch();
         else replayTick();
         if (!playing) break;
       }
@@ -323,15 +543,33 @@
     if (e.code === 'KeyK') playing = !playing;
     if (e.code === 'KeyR') startLive(e.shiftKey ? (Math.random() * 4294967296) >>> 0 : seed);
     if (e.code === 'KeyV') runVerify();
-    if (e.code === 'KeyX' && mode === 'replay') {
+    if (e.code === 'KeyB' && mode === 'replay') {
+      try {
+        ensureTree();
+        activeBranch = 'root';
+        branchStatus = '已构建分支树：在 tick ' + nearestCheckpointTick(state.tick) + ' 分叉';
+      } catch (err) { branchStatus = err.message; }
+    }
+    if (e.code === 'KeyM' && tree) runMerge();
+    if (e.code === 'KeyG' && tree) reopen();
+    if (e.code === 'Delete' && tree) pruneActive();
+    if (e.code === 'KeyX' && mode === 'replay' && !tree) {
       tamperTick = tamperTick >= 0 ? -1 : state.tick;
     }
     if (e.code === 'Period' && mode === 'replay') {
-      if (e.shiftKey) seek(state.tick + 300);
-      else if (state.tick < recording.endTick) { replayTick(); }
+      if (tree) {
+        const node = tree.get(activeBranch);
+        if (e.shiftKey) seekBranch(activeBranch, Math.min(node.cache.endTick, state.tick + 300));
+        else if (state.tick < node.cache.endTick) stepBranch();
+      } else if (e.shiftKey) seek(state.tick + 300);
+      else if (state.tick < recording.endTick) replayTick();
       playing = false;
     }
-    if (e.code === 'Comma' && mode === 'replay') { seek(state.tick - 300); playing = false; }
+    if (e.code === 'Comma' && mode === 'replay') {
+      if (tree) seekBranch(activeBranch, Math.max(tree.get(activeBranch).cache.startTick, state.tick - 300));
+      else seek(state.tick - 300);
+      playing = false;
+    }
   };
   const keyUp = e => { keys[e.code] = false; };
   window.addEventListener('keydown', keyDown);
@@ -339,11 +577,22 @@
 
   document.getElementById('bPlay').onclick = () => { playing = !playing; };
   document.getElementById('bStep').onclick = () => {
-    if (mode === 'replay' && state.tick < recording.endTick) { replayTick(); playing = false; }
-    else if (mode === 'live') { liveTick(); playing = false; }
+    if (mode === 'live') { liveTick(); playing = false; }
+    else if (tree) { if (state.tick < tree.get(activeBranch).cache.endTick) stepBranch(); playing = false; }
+    else if (state.tick < recording.endTick) { replayTick(); playing = false; }
   };
-  document.getElementById('bBack').onclick = () => { if (mode === 'replay') { seek(state.tick - 300); playing = false; } };
-  document.getElementById('bFwd').onclick = () => { if (mode === 'replay') { seek(state.tick + 300); playing = false; } };
+  document.getElementById('bBack').onclick = () => {
+    if (mode !== 'replay') return;
+    if (tree) seekBranch(activeBranch, Math.max(tree.get(activeBranch).cache.startTick, state.tick - 300));
+    else seek(state.tick - 300);
+    playing = false;
+  };
+  document.getElementById('bFwd').onclick = () => {
+    if (mode !== 'replay') return;
+    if (tree) seekBranch(activeBranch, Math.min(tree.get(activeBranch).cache.endTick, state.tick + 300));
+    else seek(state.tick + 300);
+    playing = false;
+  };
   document.getElementById('bSpeed').onclick = e => {
     speedIdx = (speedIdx + 1) % speeds.length;
     frameLoop.speed = speeds[speedIdx];
@@ -384,11 +633,44 @@
       .catch(() => alert('无法直接读取样例（file:// 限制）。请用 "加载回放" 选择 recordings/sample_fault.json，\n或在仓库根目录运行 npx serve / python3 -m http.server 后访问 web/index.html。'));
   };
 
+  document.getElementById('bBranch').onclick = () => {
+    if (mode !== 'replay') { branchStatus = '请先结束录制或载入回放'; return; }
+    try {
+      ensureTree();
+      activeBranch = 'root';
+      branchStatus = '已构建分支树：可在 tick ' + nearestCheckpointTick(state.tick) + ' 分叉';
+    } catch (e) { branchStatus = e.message; }
+  };
+  document.getElementById('bForkX').onclick = deriveX;
+  document.getElementById('bForkY').onclick = deriveY;
+  document.getElementById('bForkRaw').onclick = deriveRaw;
+  document.getElementById('bMerge').onclick = () => { if (tree) runMerge(); };
+  document.getElementById('bBranchBack').onclick = () => {
+    if (!tree) return;
+    const n = tree.get(activeBranch);
+    const parent = activeBranch === 'root' ? 'root' : (n.parentId || 'root');
+    seekBranch(parent, Math.min(state.tick, tree.get(parent).cache.endTick));
+  };
+  document.getElementById('bPrune').onclick = () => { if (tree) pruneActive(); };
+  document.getElementById('bReopen').onclick = () => { if (tree) reopen(); };
+
+  view.addEventListener('click', e => {
+    if (!tree) return;
+    const rect = view.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (view.width / rect.width);
+    const y = (e.clientY - rect.top) * (view.height / rect.height);
+    marker = { x: x, y: y };
+    pickEntity(x, y);
+  });
+
   tl.addEventListener('click', e => {
     if (mode !== 'replay') return;
     const rect = tl.getBoundingClientRect();
     const frac = (e.clientX - rect.left - 8) / (tl.width - 16);
-    seek(Math.round(frac * recording.endTick));
+    if (tree) {
+      const node = tree.get(activeBranch);
+      seekBranch(activeBranch, Math.round(frac * node.cache.endTick));
+    } else seek(Math.round(frac * recording.endTick));
   });
 
   startLive(seed);

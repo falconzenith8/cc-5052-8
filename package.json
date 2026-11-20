@@ -4,7 +4,7 @@
   "private": true,
   "description": "Deterministic game simulation recorder/replayer with checkpoint-based debugging",
   "scripts": {
-    "test": "node tests/run_tests.js && node tests/ui_smoke.js",
+    "test": "node tests/run_tests.js && node tests/branch_tests.js && node tests/ui_smoke.js",
     "record": "node main.js record --seed 42 --fault 2400 --out recordings/sample_fault.json",
     "verify": "node main.js verify recordings/sample_fault.json"
   }

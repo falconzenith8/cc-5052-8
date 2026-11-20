@@ -15,6 +15,7 @@ const SER = require('./sim/serialize.js');
 const SCENE_MOD = require('./sim/scene.js');
 const REPLAY = require('./sim/replay.js');
 const RUNNER = require('./sim/runner.js');
+const BRANCH = require('./sim/branch.js');
 
 const SCENE = SCENE_MOD.SCENE;
 
@@ -155,12 +156,151 @@ function cmdState(file, tick) {
   console.log(JSON.stringify(st, null, 2));
 }
 
+function loadRec(file) {
+  const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const errs = REPLAY.bindingCheck(SCENE, rec);
+  if (errs.length) throw new Error('binding failed: ' + errs.join('; '));
+  return rec;
+}
+
+function fmtBag(st) {
+  return st.pickups.map(function (p, i) { return p.taken ? i : null; }).filter(function (x) { return x != null; }).join(',') || '(空)';
+}
+
+function countAt(tree, id, tick) {
+  const st = tree.seek(id, tick);
+  return st.pickups.filter(function (p) { return p.taken; }).length;
+}
+
+/*
+ * branch <file> <forkTick>
+ *   在同一检查点上派生两条输入分支并做合并预演：
+ *   X 把 pickup4 的领取推迟到 tick 1200（途中少领一次）；
+ *   Y 把开门时间改到 tick 3180 并追加过门动作。
+ *   合并结果与从 tick 0 的完整重演逐项对照；原记录仍单独校验。
+ */
+function cmdBranch(file, forkTick) {
+  const rec = loadRec(file);
+  if (forkTick == null) forkTick = 300;
+  const tree = new BRANCH.BranchTree(SCENE, rec);
+  const root = tree.buildRoot();
+
+  console.log('== 原记录 ==');
+  const rootOk = REPLAY.verifyRecording(SCENE, rec);
+  console.log('  独立重放: ' + (rootOk.ok ? 'OK' : 'FAIL') +
+    '  endTick=' + rec.endTick + '  finishTick=' + rec.finishTick +
+    '  最终背包={' + fmtBag(tree.seek('root', rec.endTick)) + '}');
+
+  console.log('\n== 共享检查点 ==');
+  console.log('  检查点每 ' + tree.every + ' tick；存储 ' + tree.store.size() +
+    ' 个内容寻址快照，' + tree.store.totals().shared + ' 个被多分支共享');
+
+  // X：推迟领取 pickup4
+  const X = tree.fork('root', { id: 'X', tick: forkTick, label: 'X 推迟领取 pickup4' });
+  const vals = [];
+  {
+    const st = tree.seek('X', forkTick);
+    const scene = X.cache.scene;
+    for (let t = forkTick; t < 1200; t++) {
+      let input;
+      if (st.pickups[4].taken) input = tree._inputAt(X, t);
+      else {
+        const view = SER.deepClone(st);
+        view.pickups[4].taken = true;
+        input = require('./sim/bot.js').botInput(scene, view) & 15;
+      }
+      vals.push(input);
+      SIM.step(scene, st, input, tree.events.get(t) || []);
+    }
+  }
+  tree.update('X', function (L) {
+    L.windows = (L.windows || []).concat([{ id: 'X:delay-pickup4', start: forkTick, end: 1200, values: vals }]);
+  });
+
+  // Y：改变开门时间 + 追加动作
+  const Y = tree.fork('root', {
+    id: 'Y', tick: forkTick, label: 'Y 延后开门并追加过门',
+    layer: {
+      scene: { 'door.openTick': 3180 },
+      actions: [{ id: 'Y:wait-door', start: 2990, end: 3180, entity: 'player', intent: { kind: 'pause' } }],
+      appends: [{ id: 'Y:pass-door', start: 3180, end: 3400, entity: 'door', intent: { kind: 'pass_door' } }]
+    }
+  });
+
+  const probes = [600, 800, 1200];
+  console.log('\n== 两条分支 ==');
+  for (const b of [X, Y]) {
+    console.log('  ' + b.id + ' [' + b.label + ']  分叉@' + b.forkTick +
+      '  结束@' + b.cache.endTick + '  过门@' + b.cache.finalState.finishTick);
+    console.log('    途中已领: ' + probes.map(function (t) {
+      return 't' + t + '=' + countAt(tree, b.id, t);
+    }).join(' ') + '   最终背包={' + fmtBag(b.cache.finalState) + '}');
+  }
+  console.log('  原记录途中已领: ' + probes.map(function (t) {
+    return 't' + t + '=' + countAt(tree, 'root', t);
+  }).join(' ') + '（对照：X 在途中少领一次，终点背包相同）');
+
+  console.log('\n== 实体溯源（画面点选）==');
+  for (const id of ['pickup:4', 'door']) {
+    const p = tree.firstUse('X', id);
+    console.log('  X 点选 ' + id + ' -> ' + p.explanation);
+  }
+
+  console.log('\n== 合并预演 ==');
+  const rep = tree.mergePreview('X', 'Y');
+  for (const e of rep.edits) {
+    console.log('  [' + e.decision + '] ' + e.id + '  ' + e.reason);
+  }
+  if (rep.conflicts.length) {
+    for (const c of rep.conflicts) console.log('  冲突: ' + c.reason);
+  }
+  if (rep.merged) {
+    console.log('  合并结果: endTick=' + rep.merged.endTick + '  finishTick=' + rep.merged.finishTick +
+      '  背包={' + rep.merged.pickups.map(function (v, i) { return v ? i : null; }).filter(function (x) { return x != null; }).join(',') + '}' +
+      '  拾取触发=' + rep.merged.triggers.pickups +
+      '  开门=' + rep.merged.triggers.doorOpen + '  过门=' + rep.merged.triggers.finish);
+    console.log('  完整重演: endTick=' + rep.reference.endTick + '  finishTick=' + rep.reference.finishTick +
+      '  背包={' + rep.reference.pickups.map(function (v, i) { return v ? i : null; }).filter(function (x) { return x != null; }).join(',') + '}' +
+      '  拾取触发=' + rep.reference.triggers.pickups +
+      '  开门=' + rep.reference.triggers.doorOpen + '  过门=' + rep.reference.triggers.finish);
+    console.log('  逐项一致: ' + (rep.sameAsReference ? 'YES' : 'NO'));
+  }
+
+  console.log('\n== 删除共有输入后追加动作 ==');
+  const D = tree.fork('root', { id: 'D', tick: forkTick, label: 'D 删共有输入再加动作' });
+  tree.deleteShared('D', 3000, rec.endTick);
+  tree.appendAction('D', { id: 'D:pass-door', start: rec.endTick, end: 3500, entity: 'door', intent: { kind: 'pass_door' } });
+  console.log('  D 结束@' + D.cache.endTick + '  过门@' + D.cache.finalState.finishTick +
+    '  背包={' + fmtBag(D.cache.finalState) + '}');
+
+  console.log('\n== 检查点引用寿命 ==');
+  const before = tree.store.totals();
+  console.log('  清理前: entries=' + before.entries + ' refs=' + before.refs + ' shared=' + before.shared);
+  const trial = tree.fork('D', { id: 'T', tick: 1000, label: '试验分支' });
+  const during = tree.store.totals();
+  console.log('  派生试验分支 T 后: entries=' + during.entries + ' refs=' + during.refs + ' shared=' + during.shared);
+  const pr = tree.prune('T');
+  const after = tree.store.totals();
+  console.log('  清理 T 后: entries=' + after.entries + ' refs=' + after.refs + ' shared=' + after.shared +
+    '（释放 ' + pr.released.length + ' 个引用，母分支 D 与 root 的快照仍在）');
+  const reopened = tree.reopenFrom('root', 800);
+  const orig = REPLAY.replayToTick(SCENE, rec, 800);
+  console.log('  从母分支 root 重新开局@800: 背包={' + fmtBag(reopened.state) + '}  ' +
+    '与原记录状态一致: ' + (SER.canon(reopened.state) === SER.canon(orig) ? 'YES' : 'NO'));
+
+  console.log('\n== 说明 ==');
+  for (const line of rep.explanations) console.log('  - ' + line);
+  const bad = !rep.ok || !rootOk.ok;
+  process.exitCode = bad ? 1 : 0;
+}
+
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
 if (cmd === 'record') cmdRecord(args);
 else if (cmd === 'verify') cmdVerify(args._[1]);
 else if (cmd === 'demo') cmdDemo(args._[1], parseInt(args._[2], 10), parseInt(args._[3], 10), parseInt(args._[4] || '30', 10));
 else if (cmd === 'state') cmdState(args._[1], parseInt(args._[2], 10));
+else if (cmd === 'branch') cmdBranch(args._[1], args._[2] != null ? parseInt(args._[2], 10) : null);
 else {
-  console.log('usage:\n  node main.js record --seed N --fault T --out file.json\n  node main.js verify file.json\n  node main.js demo file.json from to [n]\n  node main.js state file.json tick');
+  console.log('usage:\n  node main.js record --seed N --fault T --out file.json\n  node main.js verify file.json\n  node main.js branch file.json [forkTick]  同一检查点派生两条分支并合并预演\n  node main.js demo file.json from to [n]\n  node main.js state file.json tick');
 }

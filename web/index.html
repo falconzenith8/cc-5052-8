@@ -37,9 +37,20 @@
       <button id="bLoad">加载回放</button>
       <button id="bSample">载入故障样例</button>
     </div>
+    <div id="controls" style="margin-top:4px">
+      <button id="bBranch">进入分支树 [B]</button>
+      <button id="bForkX">派生 X：延迟领取</button>
+      <button id="bForkY">派生 Y：延后开门</button>
+      <button id="bForkRaw">派生空白分支</button>
+      <button id="bMerge">合并预演 [M]</button>
+      <button id="bBranchBack">回到母分支</button>
+      <button id="bPrune">清理当前试验分支 [Del]</button>
+      <button id="bReopen">从母分支重新开局 [G]</button>
+    </div>
     <div id="hint">
       实况模式：← → 移动，空格/↑ 跳跃，Z 攻击，F 注入机关故障，T 结束录制进入回放。
       回放模式：K 播放/暂停，. 单步，, 后退，点击时间轴定位（借助检查点），V 校验（从头+每个检查点），X 在当前 tick 篡改输入演示偏离检测。
+      分支模式：B 进入（在上一个检查点分叉），X/Y 派生两条改动分支，画面点选实体回查首次使用它的分支输入，M 合并预演，G 从母分支重新开局。
       速度按钮只改变渲染/推进速率，不改变规则轨迹。R 重开（Shift+R 换种子）。
     </div>
   </div>
@@ -53,6 +64,7 @@
 <script src="../sim/bot.js"></script>
 <script src="../sim/recorder.js"></script>
 <script src="../sim/replay.js"></script>
+<script src="../sim/branch.js"></script>
 <script src="../sim/frameloop.js"></script>
 <script src="ui.js"></script>
 </body>
